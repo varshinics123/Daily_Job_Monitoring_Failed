@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -53,50 +54,60 @@ def get_access_token():
 
 
 # ============================================================
-# FETCH ALL PIPELINE RUNS
+# API HELPERS
+# ============================================================
+
+def make_synapse_request(token, endpoint, body):
+    url = f"{SYNAPSE_ENDPOINT}/{endpoint.lstrip('/')}"
+
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        params={"api-version": API_VERSION},
+        json=body,
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Synapse API error for {endpoint}: "
+            f"HTTP {response.status_code} - {response.text}"
+        )
+
+    return response.json()
+
+
+# ============================================================
+# FETCH PIPELINE RUNS
 # ============================================================
 
 def fetch_pipeline_runs(token):
-    url = f"{SYNAPSE_ENDPOINT}/queryPipelineRuns"
+    endpoint = "queryPipelineRuns"
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
+    request_body = {
+        "lastUpdatedAfter": (
+            WINDOW_START_UTC - timedelta(days=7)
+        ).isoformat().replace("+00:00", "Z"),
+        "lastUpdatedBefore": (
+            NOW_UTC + timedelta(minutes=5)
+        ).isoformat().replace("+00:00", "Z"),
     }
 
     all_runs = []
     continuation_token = None
 
     while True:
-        request_body = {
-            "lastUpdatedAfter": (
-                WINDOW_START_UTC - timedelta(days=7)
-            ).isoformat().replace("+00:00", "Z"),
-            "lastUpdatedBefore": (
-                NOW_UTC + timedelta(minutes=5)
-            ).isoformat().replace("+00:00", "Z"),
-        }
+        body = dict(request_body)
 
         if continuation_token:
-            request_body["continuationToken"] = continuation_token
+            body["continuationToken"] = continuation_token
 
-        response = requests.post(
-            url,
-            headers=headers,
-            params={"api-version": API_VERSION},
-            json=request_body,
-            timeout=60,
-        )
+        data = make_synapse_request(token, endpoint, body)
 
-        if not response.ok:
-            raise RuntimeError(
-                f"Synapse API error: HTTP {response.status_code} - "
-                f"{response.text}"
-            )
-
-        data = response.json()
         all_runs.extend(data.get("value", []))
-
         continuation_token = data.get("continuationToken")
 
         if not continuation_token:
@@ -106,7 +117,67 @@ def fetch_pipeline_runs(token):
 
 
 # ============================================================
-# FORMAT DATETIME
+# FETCH ACTIVITY RUNS FOR ERROR DETAILS
+# ============================================================
+
+def fetch_activity_errors(token, pipeline_run_id):
+    """
+    Retrieve activity runs for a pipeline run.
+
+    Return complete error details available from the activity-run API.
+    """
+    endpoint = "queryActivityRuns"
+
+    body = {
+        "lastUpdatedAfter": (
+            WINDOW_START_UTC - timedelta(days=7)
+        ).isoformat().replace("+00:00", "Z"),
+        "lastUpdatedBefore": (
+            NOW_UTC + timedelta(minutes=5)
+        ).isoformat().replace("+00:00", "Z"),
+        "filters": [
+            {
+                "operand": "PipelineRunId",
+                "operator": "Equals",
+                "values": [pipeline_run_id],
+            }
+        ],
+    }
+
+    data = make_synapse_request(token, endpoint, body)
+    activity_runs = data.get("value", [])
+
+    errors = []
+
+    for activity in activity_runs:
+        if str(activity.get("status", "")).lower() != "failed":
+            continue
+
+        activity_name = activity.get("activityName", "Unknown activity")
+        error = activity.get("error")
+
+        if error:
+            if isinstance(error, dict):
+                error_text = json.dumps(
+                    error,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            else:
+                error_text = str(error)
+
+            errors.append(f"{activity_name}: {error_text}")
+        else:
+            errors.append(
+                f"{activity_name}: Activity failed, but no error details "
+                f"were returned by the API."
+            )
+
+    return "\n".join(errors)
+
+
+# ============================================================
+# DATE AND ERROR HELPERS
 # ============================================================
 
 def parse_datetime(value):
@@ -116,11 +187,41 @@ def parse_datetime(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def get_pipeline_error(token, run):
+    """
+    Prefer complete activity-level errors.
+    Fall back to the pipeline-level message if no activity error exists.
+    """
+    run_id = run.get("runId", "")
+    pipeline_message = run.get("message", "")
+
+    try:
+        activity_error = fetch_activity_errors(token, run_id)
+
+        if activity_error:
+            return activity_error
+
+    except Exception as exc:
+        print(
+            f"Warning: Could not retrieve activity error details "
+            f"for run {run_id}: {exc}",
+            file=sys.stderr,
+        )
+
+    if pipeline_message:
+        return str(pipeline_message)
+
+    return (
+        "Pipeline status is Failed, but the API did not return "
+        "an error message or activity-level error details."
+    )
+
+
 # ============================================================
-# FILTER FAILED RUNS
+# FILTER FAILED RUNS AND BUILD REPORT
 # ============================================================
 
-def get_failed_runs(runs):
+def get_failed_runs(token, runs):
     failed_runs = []
 
     for run in runs:
@@ -152,7 +253,9 @@ def get_failed_runs(runs):
         )
 
         invoked_by = run.get("invokedBy") or {}
-        error_message = run.get("message", "")
+
+        # Get complete available activity-level failure details.
+        error_message = get_pipeline_error(token, run)
 
         failed_runs.append({
             "Pipeline Name": run.get("pipelineName", ""),
@@ -180,7 +283,34 @@ def get_failed_runs(runs):
 
 
 # ============================================================
-# DISPLAY RESULTS AS A TABLE
+# EXPORT COMPLETE CSV REPORT
+# ============================================================
+
+def write_csv(rows):
+    """
+    Write complete error messages to CSV.
+
+    No truncation is applied to the CSV fields.
+    """
+    with open(
+        REPORT_FILE,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=FIELDNAMES,
+            extrasaction="ignore",
+            quoting=csv.QUOTE_ALL,
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ============================================================
+# DISPLAY RESULTS AS A READABLE TABLE
 # ============================================================
 
 def display_table(rows):
@@ -193,7 +323,6 @@ def display_table(rows):
         print("=" * 160)
         return
 
-    # Print all requested column headers in table format.
     print(" | ".join(FIELDNAMES))
     print("-" * 160)
 
@@ -204,7 +333,8 @@ def display_table(rows):
             value = str(row.get(field, "") or "")
             value = value.replace("\n", " ").replace("\r", " ")
 
-            # Keep individual table cells readable in GitHub Actions logs.
+            # Truncation is only for the console display.
+            # The CSV retains the complete message.
             if len(value) > 80:
                 value = value[:77] + "..."
 
@@ -218,46 +348,27 @@ def display_table(rows):
 
 
 # ============================================================
-# EXPORT CSV
-# ============================================================
-
-def write_csv(rows):
-    with open(
-        REPORT_FILE,
-        "w",
-        newline="",
-        encoding="utf-8-sig",
-    ) as csv_file:
-        writer = csv.DictWriter(
-            csv_file,
-            fieldnames=FIELDNAMES,
-            extrasaction="ignore",
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 def main():
     print("Starting daily Synapse failed jobs monitoring.")
-    print(f"Reporting window start (UTC): {WINDOW_START_UTC.isoformat()}")
-    print(f"Reporting window end   (UTC): {NOW_UTC.isoformat()}")
+    print(f"Window start UTC: {WINDOW_START_UTC.isoformat()}")
+    print(f"Window end UTC:   {NOW_UTC.isoformat()}")
 
     token = get_access_token()
+
     pipeline_runs = fetch_pipeline_runs(token)
+    print(f"Pipeline runs retrieved: {len(pipeline_runs)}")
 
-    print(f"\nPipeline runs retrieved: {len(pipeline_runs)}")
+    failed_runs = get_failed_runs(token, pipeline_runs)
 
-    failed_runs = get_failed_runs(pipeline_runs)
-
-    # Export the report and display the results.
+    # Always create a CSV, including when no failures are found.
     write_csv(failed_runs)
     display_table(failed_runs)
 
     print(f"\nCSV report created: {REPORT_FILE}")
+    print(f"Failed runs exported: {len(failed_runs)}")
 
     return 0
 
