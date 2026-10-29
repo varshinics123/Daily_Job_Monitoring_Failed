@@ -20,9 +20,19 @@ IST = ZoneInfo("Asia/Kolkata")
 API_VERSION = "2020-12-01"
 REPORT_FILE = "synapse_pipeline_results.csv"
 
-# Reporting window: last 24 hours
 NOW_UTC = datetime.now(timezone.utc)
 WINDOW_START_UTC = NOW_UTC - timedelta(hours=24)
+
+FIELDNAMES = [
+    "Pipeline Name",
+    "Run ID",
+    "Run Start (IST)",
+    "Run End (IST)",
+    "Duration",
+    "Status",
+    "Triggered By",
+    "Error / Message",
+]
 
 
 # ============================================================
@@ -30,7 +40,6 @@ WINDOW_START_UTC = NOW_UTC - timedelta(hours=24)
 # ============================================================
 
 def get_access_token():
-    """Authenticate using the Azure service principal."""
     credential = ClientSecretCredential(
         tenant_id=TENANT_ID,
         client_id=CLIENT_ID,
@@ -44,11 +53,10 @@ def get_access_token():
 
 
 # ============================================================
-# FETCH PIPELINE RUNS
+# FETCH ALL PIPELINE RUNS
 # ============================================================
 
 def fetch_pipeline_runs(token):
-    """Fetch pipeline runs from the Synapse REST API, including pages."""
     url = f"{SYNAPSE_ENDPOINT}/queryPipelineRuns"
 
     headers = {
@@ -98,19 +106,21 @@ def fetch_pipeline_runs(token):
 
 
 # ============================================================
-# FILTER FAILED RUNS
+# FORMAT DATETIME
 # ============================================================
 
 def parse_datetime(value):
-    """Convert an ISO timestamp into a timezone-aware datetime."""
     if not value:
         return None
 
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+# ============================================================
+# FILTER FAILED RUNS
+# ============================================================
+
 def get_failed_runs(runs):
-    """Return failed pipeline runs that started within the last 24 hours."""
     failed_runs = []
 
     for run in runs:
@@ -126,7 +136,6 @@ def get_failed_runs(runs):
             continue
 
         end_time = parse_datetime(run.get("runEnd"))
-
         duration_ms = run.get("durationInMs")
 
         if duration_ms is not None:
@@ -142,7 +151,7 @@ def get_failed_runs(runs):
             else ""
         )
 
-        # Synapse may provide the failure message in the run's message field.
+        invoked_by = run.get("invokedBy") or {}
         error_message = run.get("message", "")
 
         failed_runs.append({
@@ -158,7 +167,7 @@ def get_failed_runs(runs):
             ),
             "Duration": duration_text,
             "Status": run.get("status", ""),
-            "Triggered By": run.get("invokedBy", {}).get("name", ""),
+            "Triggered By": invoked_by.get("name", ""),
             "Error / Message": error_message,
         })
 
@@ -171,50 +180,61 @@ def get_failed_runs(runs):
 
 
 # ============================================================
+# DISPLAY RESULTS AS A TABLE
+# ============================================================
+
+def display_table(rows):
+    print("\n" + "=" * 160)
+    print("DAILY SYNAPSE FAILED JOBS REPORT")
+    print("=" * 160)
+
+    if not rows:
+        print("No failed pipeline runs found in the last 24 hours.")
+        print("=" * 160)
+        return
+
+    # Print all requested column headers in table format.
+    print(" | ".join(FIELDNAMES))
+    print("-" * 160)
+
+    for row in rows:
+        values = []
+
+        for field in FIELDNAMES:
+            value = str(row.get(field, "") or "")
+            value = value.replace("\n", " ").replace("\r", " ")
+
+            # Keep individual table cells readable in GitHub Actions logs.
+            if len(value) > 80:
+                value = value[:77] + "..."
+
+            values.append(value)
+
+        print(" | ".join(values))
+
+    print("-" * 160)
+    print(f"Total failed pipeline runs: {len(rows)}")
+    print("=" * 160)
+
+
+# ============================================================
 # EXPORT CSV
 # ============================================================
 
 def write_csv(rows):
-    """Write failed runs to CSV, including headers when no failures exist."""
-    fieldnames = [
-        "Pipeline Name",
-        "Run ID",
-        "Run Start (IST)",
-        "Run End (IST)",
-        "Duration",
-        "Status",
-        "Triggered By",
-        "Error / Message",
-    ]
-
     with open(
         REPORT_FILE,
         "w",
         newline="",
         encoding="utf-8-sig",
     ) as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=FIELDNAMES,
+            extrasaction="ignore",
+        )
         writer.writeheader()
         writer.writerows(rows)
-
-
-# ============================================================
-# DISPLAY RESULTS
-# ============================================================
-
-def display_results(rows):
-    if not rows:
-        print("No failed pipeline runs found in the last 24 hours.")
-        return
-
-    print(f"\nFailed pipeline runs found: {len(rows)}")
-    print("=" * 80)
-
-    for index, row in enumerate(rows, start=1):
-        print(f"\nFailure #{index}")
-
-        for field, value in row.items():
-            print(f"{field}: {value}")
 
 
 # ============================================================
@@ -222,22 +242,22 @@ def display_results(rows):
 # ============================================================
 
 def main():
-    print("Starting daily Synapse pipeline failure monitoring.")
+    print("Starting daily Synapse failed jobs monitoring.")
     print(f"Reporting window start (UTC): {WINDOW_START_UTC.isoformat()}")
     print(f"Reporting window end   (UTC): {NOW_UTC.isoformat()}")
 
     token = get_access_token()
     pipeline_runs = fetch_pipeline_runs(token)
 
-    print(f"\nPipeline runs retrieved from API: {len(pipeline_runs)}")
+    print(f"\nPipeline runs retrieved: {len(pipeline_runs)}")
 
     failed_runs = get_failed_runs(pipeline_runs)
 
+    # Export the report and display the results.
     write_csv(failed_runs)
-    display_results(failed_runs)
+    display_table(failed_runs)
 
     print(f"\nCSV report created: {REPORT_FILE}")
-    print(f"Failed runs exported: {len(failed_runs)}")
 
     return 0
 
