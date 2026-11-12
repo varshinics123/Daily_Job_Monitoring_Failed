@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Every day at 2:30 PM IST (09:00 UTC)
+    # Daily scheduled execution at 2:30 PM IST
     - cron: '0 9 * * *'
 
 permissions:
