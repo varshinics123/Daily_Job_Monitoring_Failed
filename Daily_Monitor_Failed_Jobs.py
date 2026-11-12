@@ -21,9 +21,29 @@ IST = ZoneInfo("Asia/Kolkata")
 API_VERSION = "2020-12-01"
 REPORT_FILE = "synapse_pipeline_results.csv"
 
-# Capture one consistent reporting window for the entire run.
+# ============================================================
+# FIXED REPORTING WINDOW
+# Always report from previous day's scheduled time
+# to current day's scheduled time (09:00 UTC = 2:30 PM IST)
+# ============================================================
+
 NOW_UTC = datetime.now(timezone.utc)
-WINDOW_START_UTC = NOW_UTC - timedelta(hours=24)
+
+REPORT_HOUR_UTC = 9
+REPORT_MINUTE_UTC = 0
+
+scheduled_end = NOW_UTC.replace(
+    hour=REPORT_HOUR_UTC,
+    minute=REPORT_MINUTE_UTC,
+    second=0,
+    microsecond=0,
+)
+
+if NOW_UTC < scheduled_end:
+    scheduled_end -= timedelta(days=1)
+
+WINDOW_END_UTC = scheduled_end
+WINDOW_START_UTC = WINDOW_END_UTC - timedelta(hours=24)
 
 FIELDNAMES = [
     "Pipeline Name",
@@ -55,6 +75,7 @@ def get_access_token():
     token = credential.get_token(
         "https://dev.azuresynapse.net/.default"
     )
+
     return token.token
 
 
@@ -93,13 +114,11 @@ def fetch_pipeline_runs(token):
     endpoint = "queryPipelineRuns"
 
     base_body = {
-        # Search a wider update window so runs that started in the
-        # last 24 hours but were updated later are not missed.
         "lastUpdatedAfter": utc_iso(
             WINDOW_START_UTC - timedelta(days=7)
         ),
         "lastUpdatedBefore": utc_iso(
-            NOW_UTC + timedelta(minutes=5)
+            WINDOW_END_UTC + timedelta(minutes=5)
         ),
         "filters": [],
         "orderBy": [
@@ -136,10 +155,8 @@ def fetch_pipeline_runs(token):
         if not continuation_token:
             break
 
-    # Run ID identifies an individual pipeline execution.
-    # Deduplicate only accidental repeats of the same Run ID,
-    # never different runs of the same pipeline.
     unique_runs = {}
+
     for run in all_runs:
         run_id = run.get("runId")
         if run_id:
@@ -160,7 +177,7 @@ def fetch_activity_runs(token, pipeline_run_id):
             WINDOW_START_UTC - timedelta(days=7)
         ),
         "lastUpdatedBefore": utc_iso(
-            NOW_UTC + timedelta(minutes=5)
+            WINDOW_END_UTC + timedelta(minutes=5)
         ),
         "filters": [
             {
@@ -199,7 +216,9 @@ def parse_datetime(value):
     if not value:
         return None
 
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(
+        value.replace("Z", "+00:00")
+    )
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -211,7 +230,9 @@ def format_ist(value):
     if value is None:
         return ""
 
-    return value.astimezone(IST).strftime("%d-%m-%Y %H:%M:%S")
+    return value.astimezone(IST).strftime(
+        "%d-%m-%Y %H:%M:%S"
+    )
 
 
 # ============================================================
@@ -226,7 +247,11 @@ def fetch_error_message(token, run):
         activities = fetch_activity_runs(token, run_id)
 
         for activity in activities:
-            if str(activity.get("status", "")).lower() != "failed":
+
+            if (
+                str(activity.get("status", "")).lower()
+                != "failed"
+            ):
                 continue
 
             activity_name = activity.get(
@@ -257,24 +282,23 @@ def fetch_error_message(token, run):
 
     except Exception as exc:
         print(
-            f"WARNING: Could not retrieve activity details for "
-            f"run {run_id}: {exc}",
+            f"WARNING: Could not retrieve activity details "
+            f"for run {run_id}: {exc}",
             file=sys.stderr,
         )
 
     if errors:
         return "\n\n".join(errors)
 
-    # Fall back to the pipeline-level message when no activity
-    # error was returned.
     pipeline_message = run.get("message")
 
     if pipeline_message:
         return str(pipeline_message)
 
     return (
-        "Pipeline status is Failed, but no pipeline-level or "
-        "activity-level error message was returned by Synapse."
+        "Pipeline status is Failed, but no pipeline-level "
+        "or activity-level error message was returned "
+        "by Synapse."
     )
 
 
@@ -283,64 +307,105 @@ def fetch_error_message(token, run):
 # ============================================================
 
 def build_failed_report(token, runs):
+
     results = []
 
     for run in runs:
-        status = str(run.get("status", "")).strip().lower()
+
+        status = str(
+            run.get("status", "")
+        ).strip().lower()
 
         if status != "failed":
             continue
 
-        start_time = parse_datetime(run.get("runStart"))
-        end_time = parse_datetime(run.get("runEnd"))
+        start_time = parse_datetime(
+            run.get("runStart")
+        )
+
+        end_time = parse_datetime(
+            run.get("runEnd")
+        )
 
         if start_time is None:
             print(
-                f"WARNING: Skipping failed run without a start time: "
-                f"{run.get('runId', '')}",
+                f"WARNING: Skipping failed run without "
+                f"a start time: {run.get('runId', '')}",
                 file=sys.stderr,
             )
             continue
 
-        # Include every failed run that started in the rolling
-        # 24-hour reporting window.
-        if not (WINDOW_START_UTC <= start_time <= NOW_UTC):
+        if not (
+            WINDOW_START_UTC
+            <= start_time
+            <= WINDOW_END_UTC
+        ):
             continue
 
         duration_ms = run.get("durationInMs")
 
         if duration_ms is not None:
-            duration_seconds = max(0, int(float(duration_ms) / 1000))
+            duration_seconds = max(
+                0,
+                int(float(duration_ms) / 1000),
+            )
+
         elif end_time is not None:
             duration_seconds = max(
                 0,
-                int((end_time - start_time).total_seconds()),
+                int(
+                    (
+                        end_time - start_time
+                    ).total_seconds()
+                ),
             )
         else:
             duration_seconds = None
 
         duration_text = (
-            str(timedelta(seconds=duration_seconds))
+            str(
+                timedelta(
+                    seconds=duration_seconds
+                )
+            )
             if duration_seconds is not None
             else ""
         )
 
         invoked_by = run.get("invokedBy") or {}
 
-        error_message = fetch_error_message(token, run)
+        error_message = fetch_error_message(
+            token,
+            run,
+        )
 
         results.append({
-            "Pipeline Name": run.get("pipelineName", ""),
-            "Run ID": run.get("runId", ""),
-            "Run Start (IST)": format_ist(start_time),
-            "Run End (IST)": format_ist(end_time),
+            "Pipeline Name": run.get(
+                "pipelineName",
+                "",
+            ),
+            "Run ID": run.get(
+                "runId",
+                "",
+            ),
+            "Run Start (IST)": format_ist(
+                start_time
+            ),
+            "Run End (IST)": format_ist(
+                end_time
+            ),
             "Duration": duration_text,
-            "Status": run.get("status", ""),
-            "Triggered By": invoked_by.get("name", ""),
+            "Status": run.get(
+                "status",
+                "",
+            ),
+            "Triggered By": invoked_by.get(
+                "name",
+                "",
+            ),
             "Error / Message": error_message,
         })
 
-    # Newest failed runs first. Repeated pipeline names are retained.
     results.sort(
         key=lambda row: row["Run ID"],
         reverse=True,
@@ -350,16 +415,18 @@ def build_failed_report(token, runs):
 
 
 # ============================================================
-# EXPORT CSV WITHOUT TRUNCATING ERROR MESSAGES
+# EXPORT CSV
 # ============================================================
 
 def export_csv(rows):
+
     with open(
         REPORT_FILE,
         "w",
         newline="",
         encoding="utf-8-sig",
     ) as csv_file:
+
         writer = csv.DictWriter(
             csv_file,
             fieldnames=FIELDNAMES,
@@ -372,31 +439,56 @@ def export_csv(rows):
 
 
 # ============================================================
-# DISPLAY TABLE IN GITHUB ACTIONS LOG
+# DISPLAY TABLE
 # ============================================================
 
 def display_table(rows):
+
     print("\nDAILY SYNAPSE FAILED JOBS REPORT")
-    print(f"Window start (IST): {format_ist(WINDOW_START_UTC)}")
-    print(f"Window end   (IST): {format_ist(NOW_UTC)}")
-    print(f"Failed runs found: {len(rows)}")
+    print(
+        f"Window start (IST): "
+        f"{format_ist(WINDOW_START_UTC)}"
+    )
+
+    print(
+        f"Window end (IST): "
+        f"{format_ist(WINDOW_END_UTC)}"
+    )
+
+    print(
+        f"Failed runs found: {len(rows)}"
+    )
+
     print()
 
     print(" | ".join(FIELDNAMES))
     print("-" * 180)
 
     if not rows:
-        print("No failed pipeline runs found in the last 24 hours.")
+        print(
+            "No failed pipeline runs found "
+            "in the reporting window."
+        )
         return
 
     for row in rows:
+
         values = []
 
         for field in FIELDNAMES:
-            value = str(row.get(field, "") or "")
-            value = value.replace("\r", " ").replace("\n", " ")
 
-            # Console output only: CSV retains the complete value.
+            value = str(
+                row.get(field, "") or ""
+            )
+
+            value = value.replace(
+                "\r",
+                " "
+            ).replace(
+                "\n",
+                " "
+            )
+
             if len(value) > 100:
                 value = value[:97] + "..."
 
@@ -405,7 +497,11 @@ def display_table(rows):
         print(" | ".join(values))
 
     print("-" * 180)
-    print(f"Total failed pipeline runs exported: {len(rows)}")
+
+    print(
+        f"Total failed pipeline runs exported: "
+        f"{len(rows)}"
+    )
 
 
 # ============================================================
@@ -413,35 +509,66 @@ def display_table(rows):
 # ============================================================
 
 def main():
-    print("Starting daily Synapse failed jobs monitoring.")
-    print(f"Synapse workspace endpoint: {SYNAPSE_ENDPOINT}")
-    print(f"Reporting window start (UTC): {utc_iso(WINDOW_START_UTC)}")
-    print(f"Reporting window end   (UTC): {utc_iso(NOW_UTC)}")
+
+    print(
+        "Starting daily Synapse failed jobs monitoring."
+    )
+
+    print(
+        f"Synapse workspace endpoint: "
+        f"{SYNAPSE_ENDPOINT}"
+    )
+
+    print(
+        f"Reporting window start (UTC): "
+        f"{utc_iso(WINDOW_START_UTC)}"
+    )
+
+    print(
+        f"Reporting window end (UTC): "
+        f"{utc_iso(WINDOW_END_UTC)}"
+    )
 
     token = get_access_token()
 
     all_runs = fetch_pipeline_runs(token)
 
-    print(f"\nUnique pipeline runs retrieved: {len(all_runs)}")
+    print(
+        f"\nUnique pipeline runs retrieved: "
+        f"{len(all_runs)}"
+    )
 
-    failed_runs = build_failed_report(token, all_runs)
+    failed_runs = build_failed_report(
+        token,
+        all_runs,
+    )
 
-    # Always create the CSV, including when there are no failures.
     export_csv(failed_runs)
+
     display_table(failed_runs)
 
-    print(f"\nCSV report created: {REPORT_FILE}")
-    print(f"Rows exported: {len(failed_runs)}")
+    print(
+        f"\nCSV report created: "
+        f"{REPORT_FILE}"
+    )
+
+    print(
+        f"Rows exported: "
+        f"{len(failed_runs)}"
+    )
 
     return 0
 
 
 if __name__ == "__main__":
+
     try:
         sys.exit(main())
+
     except Exception as exc:
         print(
-            f"ERROR: Daily monitoring failed: {exc}",
+            f"ERROR: Daily monitoring failed: "
+            f"{exc}",
             file=sys.stderr,
         )
         sys.exit(1)
