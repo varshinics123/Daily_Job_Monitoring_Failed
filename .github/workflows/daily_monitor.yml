@@ -5,7 +5,7 @@ on:
 
   schedule:
     # Daily scheduled execution at 2:30 PM IST
-    - cron: '0 9 * * *'
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: read
