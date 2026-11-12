@@ -29,6 +29,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Display trigger information
+        run: |
+          echo "GitHub Event: ${{ github.event_name }}"
+          echo "Current UTC Time:"
+          date -u
+          echo "Current IST Time:"
+          TZ=Asia/Kolkata date
+
       - name: Run Synapse Failed Jobs Monitor
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
